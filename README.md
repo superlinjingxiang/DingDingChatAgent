@@ -6,6 +6,12 @@
 
 AIHelper 是一个面向企业协同场景的智能助手示例项目，目标是将大模型能力接入钉钉对话入口，并结合知识库检索、工具调用和会话记忆，提供可落地的智能客服/办公助手体验。
 
+## 界面预览
+
+下面是 AIHelper 在钉钉中的对话效果示意：
+
+![AIHelper DingTalk Chat Demo](docs/images/dingtalk-chat-demo.png)
+
 ## 技术栈
 
 - `Python 3.10+`
