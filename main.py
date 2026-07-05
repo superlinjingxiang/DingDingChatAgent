@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import requests
 import socket
 import subprocess
 import sys
@@ -47,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("server", help="启动 FastAPI 文档服务")
     subparsers.add_parser("ding", help="启动钉钉 Stream 机器人")
+    ding_user_parser = subparsers.add_parser("ding-user", help="查询钉钉用户详情")
+    ding_user_parser.add_argument(
+        "--userid",
+        help="目标用户的 userId，不传则默认读取 DINGDING_TARGET_USERID",
+    )
     ding_send_parser = subparsers.add_parser("ding-send", help="给指定用户发送一条钉钉测试消息")
     ding_send_parser.add_argument(
         "--robot-code",
@@ -147,6 +153,37 @@ def cmd_ding() -> int:
     from src.DingWebHook import main as ding_main
 
     ding_main()
+    return 0
+
+
+def cmd_ding_user(user_id: str | None) -> int:
+    app_key = os.getenv("DINGDING_ID")
+    app_secret = os.getenv("DINGDING_SECRET")
+    resolved_user_id = user_id or os.getenv("DINGDING_TARGET_USERID")
+
+    if not app_key or not app_secret:
+        print("缺少 DINGDING_ID 或 DINGDING_SECRET")
+        return 2
+    if not resolved_user_id:
+        print("缺少 userId，请设置 DINGDING_TARGET_USERID 或传 --userid")
+        return 2
+
+    token_response = requests.post(
+        "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+        json={"appKey": app_key, "appSecret": app_secret},
+        timeout=20,
+    )
+    token_response.raise_for_status()
+    access_token = token_response.json()["accessToken"]
+
+    user_response = requests.post(
+        f"https://oapi.dingtalk.com/topapi/v2/user/get?access_token={access_token}",
+        json={"userid": resolved_user_id},
+        timeout=20,
+    )
+    user_response.raise_for_status()
+    payload = user_response.json()
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -265,6 +302,40 @@ def _find_listening_pids(port: int) -> list[int]:
     return sorted(pids)
 
 
+def _find_python_processes(pattern: str) -> list[int]:
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            (
+                "Get-CimInstance Win32_Process | "
+                "Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match "
+                f"'{pattern}' }} | "
+                "Select-Object -ExpandProperty ProcessId"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+
+    pids: list[int] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pid = int(line)
+        except ValueError:
+            continue
+        if pid != os.getpid():
+            pids.append(pid)
+    return pids
+
+
 def _kill_process_tree(pid: int) -> None:
     subprocess.run(
         ["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -336,7 +407,7 @@ def _stop_child(proc: subprocess.Popen) -> None:
 
 def cmd_all() -> int:
     """Start Redis, the DingTalk bot and API server together."""
-    children: dict[str, tuple[str, subprocess.Popen]] = {}
+    children: dict[str, dict[str, object]] = {}
     redis_started = False
 
     redis_proc = _launch_redis()
@@ -347,11 +418,20 @@ def cmd_all() -> int:
         print("redis: already running or skipped", flush=True)
 
     _free_port(SERVER_PORT, "server")
-    children["server"] = ("src.Server", _launch_child("server", "src.Server"))
-    children["ding"] = ("src.DingWebHook", _launch_child("ding", "src.DingWebHook"))
+    children["server"] = {
+        "module": "src.Server",
+        "proc": _launch_child("server", "src.Server"),
+        "ready_deadline": time.time() + 15,
+    }
+    children["ding"] = {
+        "module": "src.DingWebHook",
+        "proc": _launch_child("ding", "src.DingWebHook"),
+        "ready_deadline": time.time() + 15,
+    }
 
     print("已启动一键模式：redis + server + ding", flush=True)
-    for name, (_, proc) in children.items():
+    for name, child in children.items():
+        proc = child["proc"]
         print(f"{name}: pid={proc.pid}", flush=True)
 
     try:
@@ -362,21 +442,39 @@ def cmd_all() -> int:
                 if redis_proc is not None:
                     print(f"redis: pid={redis_proc.pid}", flush=True)
 
-            for name, (module_name, proc) in list(children.items()):
+            for name, child in list(children.items()):
+                module_name = child["module"]
+                proc = child["proc"]
+                ready_deadline = child["ready_deadline"]
+
+                if name == "server":
+                    healthy = _is_port_open(SERVER_HOST, SERVER_PORT)
+                else:
+                    healthy = bool(_find_python_processes(r"src\.DingWebHook"))
+
+                if healthy:
+                    continue
+                if time.time() < ready_deadline:
+                    continue
+
                 code = proc.poll()
-                if code is not None:
-                    print(f"{name} 已退出，退出码: {code}，正在重启...", flush=True)
-                    time.sleep(2)
-                    if name == "server":
-                        _free_port(SERVER_PORT, "server")
-                    new_proc = _launch_child(name, module_name)
-                    children[name] = (module_name, new_proc)
-                    print(f"{name}: pid={new_proc.pid}", flush=True)
+                code_text = code if code is not None else "unknown"
+                print(f"{name} 未处于健康状态，退出码: {code_text}，正在重启...", flush=True)
+                time.sleep(2)
+                if name == "server":
+                    _free_port(SERVER_PORT, "server")
+                new_proc = _launch_child(name, module_name)
+                children[name] = {
+                    "module": module_name,
+                    "proc": new_proc,
+                    "ready_deadline": time.time() + 15,
+                }
+                print(f"{name}: pid={new_proc.pid}", flush=True)
             time.sleep(1)
     except KeyboardInterrupt:
         print("收到中断，正在停止所有子进程...", flush=True)
-        for _, proc in children.values():
-            _stop_child(proc)
+        for child in children.values():
+            _stop_child(child["proc"])
         if redis_started:
             _shutdown_redis()
         return 130
@@ -398,6 +496,8 @@ def main() -> int:
         return cmd_server()
     if command == "ding":
         return cmd_ding()
+    if command == "ding-user":
+        return cmd_ding_user(args.userid)
     if command == "ding-send":
         return cmd_ding_send(
             args.robot_code,

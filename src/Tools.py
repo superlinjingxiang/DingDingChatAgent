@@ -49,6 +49,14 @@ class DingTalkClient:
         self.app_key = os.getenv("DINGDING_ID")
         self.app_secret = os.getenv("DINGDING_SECRET")
         self.union_id = os.getenv("DINGDING_UNION_ID")
+
+    @staticmethod
+    def raise_for_status_with_detail(response: requests.Response, action: str) -> None:
+        try:
+            response.raise_for_status()
+        except requests.exceptions.RequestException as exc:
+            detail = response.text
+            raise RuntimeError(f"{action}失败: HTTP {response.status_code} {detail}") from exc
         
     def get_access_token(self) -> str:
         if not all([self.app_key, self.app_secret, self.union_id]):
@@ -57,9 +65,10 @@ class DingTalkClient:
         try:
             response = requests.post(
                 "https://api.dingtalk.com/v1.0/oauth2/accessToken",
-                json={"appKey": self.app_key, "appSecret": self.app_secret}
+                json={"appKey": self.app_key, "appSecret": self.app_secret},
+                timeout=20,
             )
-            response.raise_for_status()
+            self.raise_for_status_with_detail(response, "获取访问令牌")
             token = response.json().get("accessToken")
             if not token:
                 raise ValueError("获取钉钉访问令牌失败")
@@ -218,11 +227,12 @@ def create_todo(todo: TodoInput) -> str:
                 "Content-Type": "application/json",
                 "x-acs-dingtalk-access-token": token
             },
-            json=todo_data
+            json=todo_data,
+            timeout=20,
         )
-        response.raise_for_status()
+        client.raise_for_status_with_detail(response, "创建待办事项")
         return f"成功创建待办事项: {todo.subject}"
-    except requests.exceptions.RequestException as e:
+    except Exception as e:
         return f"创建待办事项失败: {str(e)}"
 
 @tool
